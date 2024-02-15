@@ -1,0 +1,99 @@
+with get_cumulative_deposits as (
+select
+  player_key,
+  license_uid,
+  date,
+  sum(approved_deposit_amount_EUR) over (partition by player_key order by date) as cumulative_deposit
+from
+  `leo-production-bi.DW_Fact_Management_Analysis.fact_core_daily_no_personal_history`
+)
+
+, get_threshold_players as (
+select
+  player_key,
+  min(date) as threshold_date
+from
+  get_cumulative_deposits
+where
+  license_uid = 'MGA'
+  and cumulative_deposit >= 2000
+  and date >= '2023-01-01'
+  and date < '2024-01-01'
+group by player_key
+)
+
+, get_person_details as (
+select
+  th.player_key,
+  threshold_date,
+  person_id_legal_entity,
+  case when person_id_legal_entity is null then th.player_key else person_id_legal_entity end as subjectID
+from get_threshold_players th
+left join `leo-production-bi.DW_Dim.dim_player_latest` dim on th.player_key = dim.player_key 
+)
+
+, get_person_scores as (
+select
+  aml.person_id_legal_entity as aml_person, dim.person_id_legal_entity as person_dim, score, date
+from
+  `leo-production-bi.DW_DATA_SCIENCE.money_laundering_detection_service` aml
+left join
+  `leo-production-bi.DW_Dim.dim_player_latest` dim on aml.person_id_legal_entity = dim.person_id_legal_entity
+where
+  aml.person_id_legal_entity is not null and dim.license_uid = 'MGA'
+)
+
+, get_player_scores as (
+select
+  aml.player_id as aml_player, dim.person_id_legal_entity as person_dim, score, date
+from
+  `leo-production-bi.DW_DATA_SCIENCE.money_laundering_detection_service` aml
+left join
+  `leo-production-bi.DW_Dim.dim_player_latest` dim on aml.player_id = dim.player_key
+where
+  aml.person_id_legal_entity is null and dim.license_uid = 'MGA'
+)
+
+, get_score_union as (
+select aml_person as subjectID, person_dim, score, date from get_person_scores
+union all
+select aml_player as subjectID, person_dim, score, date from get_player_scores
+)
+
+, agg_get_score_union as (
+select
+  case when person_dim is not null then person_dim else subjectID end as subjectID
+  , score
+  , date 
+from get_score_union
+)
+
+, get_highest_score as (
+select *
+from (
+      select subjectID, score, date as score_date
+      , row_number() over (partition by subjectID order by score desc, date desc) rn 
+      from agg_get_score_union
+      where score > 0.85 
+      and date >= '2023-01-01' and date < '2024-01-01'
+      )
+where rn = 1
+)
+
+  , get_latest_fs_tag as (
+select *
+from (
+      select playerid, tag, created_at as tag_date
+      , row_number() over (partition by playerid order by created_at desc) rn
+      from `leo-production-bi.DW_Operations.player_rf_tags_aggregated`
+      where tag in ('Factsheet Update Compiled', 'FACTSHEET COMPILED', 'FACTSHEET UPDATE')
+      )
+where rn = 1
+)
+
+select a.player_key, a.person_id_legal_entity, a.threshold_date,
+score as highest_2023_score, score_date, 
+tag, DATE(tag_date) as tag_date
+from get_person_details a
+left join get_highest_score b on a.subjectID = b.subjectID 
+left join get_latest_fs_tag c on a.player_key = CAST(c.playerid AS STRING)
